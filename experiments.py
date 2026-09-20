@@ -41,10 +41,8 @@ def _save(summary, path):
 E1_CANDIDATES = [
     {"name": "E1A_base", "lr_encoder": 1e-5, "lr_decoder": 1e-4, "weight_decay": 1e-4},
     {"name": "E1B_low_lr", "lr_encoder": 5e-6, "lr_decoder": 5e-5, "weight_decay": 1e-4},
-    {"name": "E1C_low_wd", "lr_encoder": 1e-5, "lr_decoder": 1e-4, "weight_decay": 1e-5},
     {"name": "E1D_higher_dec", "lr_encoder": 1e-5, "lr_decoder": 2e-4, "weight_decay": 1e-4},
 ]
-E1_DEFAULT = ["E1A_base", "E1B_low_lr", "E1D_higher_dec"]
 
 
 def cmd_e1_search(args):
@@ -54,7 +52,7 @@ def cmd_e1_search(args):
     splits = _ensure_splits(cfg)
     out_dir = Path(cfg["output_dir"]) / "e1_search"
 
-    wanted = args.candidates or E1_DEFAULT
+    wanted = args.candidates or [c["name"] for c in E1_CANDIDATES]
     summary = {"candidates": [], "best": None, "baseline_mer_test": None}
     best = (-1.0, "", "")
 
@@ -65,7 +63,6 @@ def cmd_e1_search(args):
         model, _ = train_supervised(splits["msl_train"], splits["msl_val"], cfg_c, device)
         ckpt = out_dir / (name + ".pt")
         save_checkpoint(model, str(ckpt), extra={"hparams": cand})
-
         msl_val = evaluate_split(model, splits["msl_val"], cfg_c, device, amp=cfg.get("amp", False))
         mer_val = evaluate_split(model, splits["mer_val"], cfg_c, device, amp=cfg.get("amp", False))
         print(" ", name, "msl_val", round(msl_val["mIoU"], 4), "mer_val", round(mer_val["mIoU"], 4))
@@ -78,13 +75,10 @@ def cmd_e1_search(args):
     summary["candidates"].sort(key=lambda r: r["msl_val_mIoU"], reverse=True)
     summary["best"] = {"name": best[1], "ckpt": best[2], "msl_val_mIoU": best[0]}
     print("\nbest by msl_val:", best[1], round(best[0], 4))
-
     if best[2]:
-        print("baseline test of winner:")
         m = load_checkpoint(best[2], cfg["num_classes"], device)
         summary["baseline_mer_test"] = _eval(m, splits, ["mer_test"], cfg, device)
     _save(summary, out_dir / "e1_hparam_summary.json")
-    print("winner checkpoint:", best[2])
 
 
 def cmd_pipeline(args):
@@ -100,49 +94,35 @@ def cmd_pipeline(args):
     e1_ckpt = run / "E1.pt"
     save_checkpoint(model, str(e1_ckpt))
     summary["experiments"]["E1"] = {"best_msl_val_mIoU": hist["best_miou"], "ckpt": str(e1_ckpt)}
-
-    print("\n========== E2: baseline (val) ==========")
-    summary["experiments"]["E2_baseline_val"] = _eval(model, splits, ["msl_val", "mer_val", "m2020_val"], cfg, device)
+    summary["experiments"]["baseline_val"] = _eval(model, splits, ["msl_val", "mer_val"], cfg, device)
 
     ckpts = {"baseline": str(e1_ckpt)}
-    stages = [
-        ("coral", "coral"),
-        ("mmd", "mmd"),
-        ("dann", "dann"),
-        ("adda", "adda"),
-        ("finetune", "finetune"),
-        ("pseudolabel", "pseudolabel"),
-        ("mean_teacher", "mean_teacher"),
-    ]
-    for name, method in stages:
+    stages = ["coral", "mmd", "dann", "adda", "pseudolabel", "mean_teacher"]
+    for method in stages:
         print("\n==========", method, "(from E1) ==========")
         if method == "adda":
             cfg_m = get_config("adda", **{k: cfg[k] for k in ("data_root", "output_dir")})
-        elif method in ("finetune", "pseudolabel", "mean_teacher"):
+        elif method in ("pseudolabel", "mean_teacher"):
             cfg_m = get_config("followup", **{k: cfg[k] for k in ("data_root", "output_dir")})
         else:
             cfg_m = cfg
         m, h = run_method(method, splits, cfg_m, device, init_ckpt=str(e1_ckpt))
-        ckpt = run / (name + ".pt")
+        ckpt = run / (method + ".pt")
         save_checkpoint(m, str(ckpt))
-        ckpts[name] = str(ckpt)
-        summary["experiments"][name] = {"best_mer_val_mIoU": h["best_miou"], "ckpt": str(ckpt)}
+        ckpts[method] = str(ckpt)
+        summary["experiments"][method] = {"best_mer_val_mIoU": h["best_miou"], "ckpt": str(ckpt)}
 
-    print("\n========== FINAL TEST (once) ==========")
+    print("\n========== FINAL TEST ==========")
     for name, ckpt in ckpts.items():
-        if not Path(ckpt).exists():
-            continue
         print(" --", name, "--")
         m = load_checkpoint(ckpt, cfg["num_classes"], device)
-        summary["final_test"][name] = _eval(m, splits, ["msl_test", "mer_test", "m2020_val"], cfg, device)
-
+        summary["final_test"][name] = _eval(m, splits, ["msl_test", "mer_test"], cfg, device)
     _save(summary, run / "summary.json")
 
 
 FOLLOWUP = [
-    ("F0_finetune", "finetune", {}),
-    ("F1_pseudolabel", "pseudolabel", {}),
-    ("F2_mean_teacher", "mean_teacher", {}),
+    ("pseudolabel", "pseudolabel", {}),
+    ("mean_teacher", "mean_teacher", {}),
 ]
 
 
@@ -152,41 +132,24 @@ def cmd_followup(args):
     device = setup_device(cfg)
     splits = _ensure_splits(cfg)
     run = Path(cfg["output_dir"]) / "followup"
+    if not (args.init_ckpt and Path(args.init_ckpt).exists()):
+        raise FileNotFoundError("--init-ckpt required")
 
-    init_ckpt = args.init_ckpt
-    if not (init_ckpt and Path(init_ckpt).exists()):
-        raise FileNotFoundError("--init-ckpt (E1 winner) is required and must exist")
-
-    summary = {"init_ckpt": init_ckpt, "experiments": {}, "ranking": [], "finalists": [], "final_test": {}}
+    summary = {"init_ckpt": args.init_ckpt, "experiments": {}, "final_test": {}}
     for name, method, overrides in FOLLOWUP:
-        print("\n==========", name, method, "==========")
-        cfg_e = {**cfg, **overrides}
-        model, hist = run_method(method, splits, cfg_e, device, init_ckpt=init_ckpt)
+        print("\n==========", name, "==========")
+        model, _ = run_method(method, splits, {**cfg, **overrides}, device, init_ckpt=args.init_ckpt)
         ckpt = run / (name + ".pt")
         save_checkpoint(model, str(ckpt))
         mer_val = evaluate_split(model, splits["mer_val"], cfg, device, amp=cfg.get("amp", False))
         summary["experiments"][name] = {"ckpt": str(ckpt), "mer_val_mIoU": mer_val["mIoU"]}
-        print(" ", name, "mer_val mIoU", round(mer_val["mIoU"], 4))
-
-    ranking = sorted(summary["experiments"].items(), key=lambda kv: kv[1]["mer_val_mIoU"], reverse=True)
-    summary["ranking"] = [{"name": n, "mer_val_mIoU": e["mer_val_mIoU"]} for n, e in ranking]
-    finalists = [n for n, _ in ranking[: max(1, args.topk)]]
-    summary["finalists"] = finalists
-    print("\n========== RANKING (mer_val) ==========")
-    for row in summary["ranking"]:
-        print(" ", row["name"], "mer_val", round(row["mer_val_mIoU"], 4))
-
-    print("\n========== FINAL TEST (finalists only) ==========")
-    for name in finalists:
-        print(" --", name, "--")
-        m = load_checkpoint(summary["experiments"][name]["ckpt"], cfg["num_classes"], device)
-        summary["final_test"][name] = _eval(m, splits, ["mer_test", "msl_test", "m2020_val"], cfg, device)
-
+        print(" ", name, "mer_val", round(mer_val["mIoU"], 4))
+        summary["final_test"][name] = _eval(model, splits, ["mer_test", "msl_test"], cfg, device)
     _save(summary, run / "followup_summary.json")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Reproduce the report experiment protocols.")
+    p = argparse.ArgumentParser(description="Reproduce report experiment protocols.")
     p.add_argument("--data-root", default=None)
     p.add_argument("--output-dir", default="outputs")
     sub = p.add_subparsers(dest="command", required=True)
@@ -200,7 +163,6 @@ def main():
 
     s = sub.add_parser("followup")
     s.add_argument("--init-ckpt", required=True)
-    s.add_argument("--topk", type=int, default=2)
     s.set_defaults(func=cmd_followup)
 
     args = p.parse_args()

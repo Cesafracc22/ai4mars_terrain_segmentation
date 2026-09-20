@@ -1,4 +1,11 @@
-"""ResNet34 encoder + U-Net decoder."""
+"""resnet34 encoder and u-net decoder
+
+imported and adapted from https://github.com/gyb357/UNet-Segmentation
+same encoder staging stem maxpool layer1 to layer4
+same skip set pre-pool stem and layer1 to layer3
+differences torchvision resnet34 weights simpler upblock channels
+bilinear upsample and 1x1 head no unetplusplus unet3plus deep supervision or cgm
+"""
 
 from __future__ import annotations
 

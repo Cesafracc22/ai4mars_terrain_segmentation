@@ -43,10 +43,8 @@ DEFAULTS: dict = {
     "dann_lambda_max": 0.1,
     "mmd_sigma": 1.0,
 
-    "epochs_uda": 10,
     "epochs_semisup": 10,
     "uda_lr_factor": 0.1,
-    "semisup_lr_factor": 0.1,
 
     # Pseudo-labeling (Lee): CE on labeled MER + α(t)·CE on hard unlabeled masks.
     "semisup_lambda_uda": 1.0,
@@ -69,7 +67,6 @@ DEFAULTS: dict = {
     "adda_lambda_adv": 0.1,
     "adda_lambda_coral": 0.1,
     "adda_adv_ramp": True,
-    "adda_train_decoder": True,
 }
 
 PRESET_BUDGET: dict = {}
@@ -78,19 +75,13 @@ PRESET_ADDA: dict = {
     "batch_size": 32,
 }
 
-# Slightly longer / lower LR for MER semi-supervised runs.
 PRESET_FOLLOWUP: dict = {
     "epochs_semisup": 12,
     "uda_lr_factor": 0.05,
-    "semisup_lr_factor": 0.05,
     "semisup_lambda_uda": 1.0,
     "semisup_lambda_ramp_epochs": 4,
     "uda_confidence_threshold": 0.9,
     "uda_min_pseudo_pixels": 100,
-    "mt_ema_decay": 0.99,
-    "mt_consistency_weight": 1.0,
-    "mt_rampup_epochs": 5,
-    "mt_noise_std": 0.1,
 }
 
 PRESETS = {"budget": PRESET_BUDGET, "followup": PRESET_FOLLOWUP, "adda": PRESET_ADDA}

@@ -53,6 +53,8 @@ def mmd_loss(source: torch.Tensor, target: torch.Tensor, sigma: float = 1.0, max
     return k_ss.mean() + k_tt.mean() - 2 * k_st.mean()
 
 
+# dann helpers imported and adapted from https://github.com/fungtion/DANN
+# ganin et al grl and domain discriminator
 class GradientReversal(Function):
     """Reverse gradients through the discriminator path (DANN)."""
 
@@ -100,6 +102,9 @@ def adversarial_encoder_loss(logits: torch.Tensor) -> torch.Tensor:
     return F.binary_cross_entropy_with_logits(logits, torch.zeros_like(logits))
 
 
+# mean teacher helpers imported and adapted from
+# https://github.com/CuriousAI/mean-teacher
+# tarvainen and valpola
 @torch.no_grad()
 def update_ema(teacher: nn.Module, student: nn.Module, decay: float) -> None:
     """EMA weights; also copy BN buffers (Mean Teacher)."""
