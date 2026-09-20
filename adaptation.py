@@ -1,4 +1,4 @@
-"""Domain adaptation losses and helpers (CORAL, MMD, DANN, EMA)."""
+"""Domain adaptation losses and helpers (CORAL, MMD, DANN, Mean Teacher)."""
 
 from __future__ import annotations
 
@@ -102,14 +102,31 @@ def adversarial_encoder_loss(logits: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def update_ema(teacher: nn.Module, student: nn.Module, decay: float) -> None:
+    """EMA weights; also copy BN buffers (Mean Teacher)."""
     for t, s in zip(teacher.parameters(), student.parameters()):
         t.data.mul_(decay).add_(s.data, alpha=1.0 - decay)
+    for t, s in zip(teacher.buffers(), student.buffers()):
+        t.copy_(s)
 
 
 def clone_teacher(model: nn.Module) -> nn.Module:
-    """Frozen copy for EMA pseudo-labels."""
+    """Frozen EMA teacher copy."""
     teacher = deepcopy(model)
     for p in teacher.parameters():
         p.requires_grad_(False)
     teacher.eval()
     return teacher
+
+
+def sigmoid_rampup(current: float, rampup_length: float) -> float:
+    """Mean Teacher consistency weight: exp(-5(1-t)^2)."""
+    if rampup_length <= 0:
+        return 1.0
+    current = max(0.0, min(float(current), float(rampup_length)))
+    phase = 1.0 - current / rampup_length
+    return float(math.exp(-5.0 * phase * phase))
+
+
+def consistency_mse(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+    """MSE between student and teacher softmax maps."""
+    return F.mse_loss(F.softmax(student_logits, dim=1), F.softmax(teacher_logits, dim=1))

@@ -17,12 +17,14 @@ from adaptation import (
     GradientReversal,
     adversarial_encoder_loss,
     clone_teacher,
+    consistency_mse,
     coral_loss,
     domain_discriminator_loss,
     feat_map,
     gap_features,
     grl_lambda,
     mmd_loss,
+    sigmoid_rampup,
     update_ema,
 )
 from data import SegmentationDataset, UnlabeledDataset
@@ -47,22 +49,6 @@ def _uda_lr(cfg: dict) -> float:
     return cfg.get("lr_decoder", cfg["lr"]) * cfg.get("uda_lr_factor", 0.1)
 
 
-def _confidence_threshold(cfg: dict, epoch: int, total_epochs: int) -> float:
-    start = cfg["uda_confidence_threshold"]
-    end = cfg.get("uda_confidence_threshold_end")
-    if end is None or total_epochs <= 1:
-        return start
-    ramp = cfg.get("uda_confidence_ramp_epochs") or total_epochs
-    t = min(1.0, epoch / max(ramp - 1, 1))
-    return start + (end - start) * t
-
-
-def _freeze_encoder(model: NavSegmenter, freeze: bool) -> None:
-    for mod in (model.stem, model.pool, model.enc1, model.enc2, model.enc3, model.enc4):
-        for p in mod.parameters():
-            p.requires_grad = not freeze
-
-
 def _freeze_model(model: NavSegmenter, freeze: bool) -> None:
     for p in model.parameters():
         p.requires_grad = not freeze
@@ -78,7 +64,7 @@ def _decoder_params(model: NavSegmenter):
 
 @torch.no_grad()
 def generate_pseudo_labels(model, images, threshold, ignore_index=255, amp=False) -> torch.Tensor:
-    """Per-pixel pseudo labels; low-confidence pixels set to ignore."""
+    """Per-pixel hard labels; low-confidence pixels set to ignore."""
     model.eval()
     with amp_autocast(images.device, amp):
         logits = model(images)
@@ -86,6 +72,12 @@ def generate_pseudo_labels(model, images, threshold, ignore_index=255, amp=False
     pseudo = pseudo.clone()
     pseudo[conf < threshold] = ignore_index
     return pseudo
+
+
+def _input_noise(x: torch.Tensor, std: float) -> torch.Tensor:
+    if std <= 0:
+        return x
+    return x + torch.randn_like(x) * std
 
 
 def _best_state(model, val_miou, best):
@@ -311,57 +303,8 @@ def train_adda(model, src_samples, tgt_samples, val_samples, cfg, device):
     return model, history
 
 
-def train_pseudolabel(model, uda_samples, val_samples, cfg, device, use_ema=False):
-    """Self-training on unlabeled MER; optional EMA teacher."""
-    model = model.to(device)
-    teacher = clone_teacher(model).to(device) if use_ema else None
-    ema_decay = cfg.get("ema_decay") or 0.99
-    criterion = nn.CrossEntropyLoss(ignore_index=cfg["ignore_index"])
-    optim = torch.optim.AdamW(model.parameters(), lr=_uda_lr(cfg), weight_decay=cfg["weight_decay"])
-    amp = use_amp(cfg)
-    scaler = grad_scaler(amp)
-
-    uda_loader = _unlabeled_loader(uda_samples, cfg, shuffle=True)
-    val_loader = _seg_loader(val_samples, cfg, shuffle=False)
-    epochs = cfg["epochs_uda"]
-    min_px = cfg.get("uda_min_pseudo_pixels", 100)
-    freeze_epochs = cfg.get("uda_freeze_encoder_epochs", 0)
-
-    history = {"val_miou": []}
-    best = (-1.0, None)
-    tag = "PL-EMA" if use_ema else "PL"
-
-    for epoch in range(epochs):
-        _freeze_encoder(model, epoch < freeze_epochs)
-        threshold = _confidence_threshold(cfg, epoch, epochs)
-        model.train()
-        for images in uda_loader:
-            images = images.to(device)
-            pseudo = generate_pseudo_labels(teacher or model, images, threshold, cfg["ignore_index"], amp=amp)
-            if (pseudo != cfg["ignore_index"]).sum() < min_px:
-                continue
-            optim.zero_grad(set_to_none=True)
-            with amp_autocast(images.device, amp):
-                loss = criterion(model(images), pseudo)
-            scaler.scale(loss).backward()
-            scaler.step(optim)
-            scaler.update()
-            if teacher is not None:
-                update_ema(teacher, model, ema_decay)
-
-        val = evaluate_model(model, val_loader, device, cfg["num_classes"], cfg["ignore_index"], amp=amp)
-        history["val_miou"].append(val["mIoU"])
-        print(tag, "epoch", epoch + 1, "thr", round(threshold, 2), "mer_val_mIoU", round(val["mIoU"], 4))
-        best = _best_state(model, val["mIoU"], best)
-
-    if best[1] is not None:
-        model.load_state_dict(best[1])
-    history["best_miou"] = best[0]
-    return model, history
-
-
-def train_semisup(model, labeled_samples, uda_samples, val_samples, cfg, device):
-    """Two-phase: labeled MER epochs, then pseudo-label epochs."""
+def train_finetune(model, labeled_samples, val_samples, cfg, device):
+    """Fine-tune on 200 labeled MER images only (no unlabeled loss)."""
     if not labeled_samples:
         raise ValueError("mer_labeled_adapt is empty")
     model = model.to(device)
@@ -375,16 +318,11 @@ def train_semisup(model, labeled_samples, uda_samples, val_samples, cfg, device)
     scaler = grad_scaler(amp)
 
     labeled_loader = _seg_loader(labeled_samples, cfg, shuffle=True)
-    uda_loader = _unlabeled_loader(uda_samples, cfg, shuffle=True) if uda_samples else None
     val_loader = _seg_loader(val_samples, cfg, shuffle=False)
-    epochs = cfg["epochs_semisup"]
-    threshold = cfg["uda_confidence_threshold"]
-    lam = cfg.get("semisup_lambda_uda", 1.0)
-
     history = {"val_miou": []}
     best = (-1.0, None)
 
-    for epoch in range(epochs):
+    for epoch in range(cfg["epochs_semisup"]):
         model.train()
         for images, labels in labeled_loader:
             images, labels = images.to(device), labels.to(device)
@@ -395,22 +333,9 @@ def train_semisup(model, labeled_samples, uda_samples, val_samples, cfg, device)
             scaler.step(optim)
             scaler.update()
 
-        if uda_loader is not None and lam > 0:
-            for images in uda_loader:
-                images = images.to(device)
-                pseudo = generate_pseudo_labels(model, images, threshold, cfg["ignore_index"], amp=amp)
-                if (pseudo != cfg["ignore_index"]).sum() < 100:
-                    continue
-                optim.zero_grad(set_to_none=True)
-                with amp_autocast(images.device, amp):
-                    loss = lam * criterion(model(images), pseudo)
-                scaler.scale(loss).backward()
-                scaler.step(optim)
-                scaler.update()
-
         val = evaluate_model(model, val_loader, device, cfg["num_classes"], cfg["ignore_index"], amp=amp)
         history["val_miou"].append(val["mIoU"])
-        print("Semisup epoch", epoch + 1, "mer_val_mIoU", round(val["mIoU"], 4))
+        print("Finetune epoch", epoch + 1, "mer_val_mIoU", round(val["mIoU"], 4))
         best = _best_state(model, val["mIoU"], best)
 
     if best[1] is not None:
@@ -419,57 +344,57 @@ def train_semisup(model, labeled_samples, uda_samples, val_samples, cfg, device)
     return model, history
 
 
-def train_semisup_joint(model, labeled_samples, uda_samples, val_samples, cfg, device):
-    """Labeled + pseudo loss in one step; optional EMA teacher."""
+def train_pseudolabel(model, labeled_samples, uda_samples, val_samples, cfg, device):
+    """Lee-style pseudo-labeling: CE on labeled MER + α·CE on hard unlabeled masks."""
     if not labeled_samples:
         raise ValueError("mer_labeled_adapt is empty")
+    if not uda_samples:
+        raise ValueError("mer_uda is empty")
+
     model = model.to(device)
-    ema_decay = cfg.get("ema_decay")
-    teacher = clone_teacher(model).to(device) if ema_decay else None
     criterion = nn.CrossEntropyLoss(ignore_index=cfg["ignore_index"])
     optim = torch.optim.AdamW(model.parameters(), lr=_uda_lr(cfg), weight_decay=cfg["weight_decay"])
     amp = use_amp(cfg)
     scaler = grad_scaler(amp)
 
     labeled_loader = _seg_loader(labeled_samples, cfg, shuffle=True)
-    uda_loader = _unlabeled_loader(uda_samples, cfg, shuffle=True) if uda_samples else None
+    uda_loader = _unlabeled_loader(uda_samples, cfg, shuffle=True)
     val_loader = _seg_loader(val_samples, cfg, shuffle=False)
 
     epochs = cfg["epochs_semisup"]
-    lambda_uda = cfg.get("semisup_lambda_uda", 1.0)
+    lambda_u = cfg.get("semisup_lambda_uda", 1.0)
     ramp = cfg.get("semisup_lambda_ramp_epochs", 0)
-    warmup = cfg.get("semisup_pseudo_warmup_epochs", 1)
     min_px = cfg.get("uda_min_pseudo_pixels", 100)
+    threshold = cfg["uda_confidence_threshold"]
+    ignore = cfg["ignore_index"]
 
     history = {"val_miou": []}
     best = (-1.0, None)
 
     for epoch in range(epochs):
-        lam = lambda_uda * min(1.0, (epoch + 1) / ramp) if ramp > 0 else lambda_uda
-        threshold = _confidence_threshold(cfg, epoch, epochs)
+        # Lee α(t): ramp unlabeled weight from 0 → lambda_u
+        alpha = lambda_u * min(1.0, (epoch + 1) / ramp) if ramp > 0 else lambda_u
         model.train()
-        uda_iter = cycle(uda_loader) if uda_loader and lam > 0 and epoch >= warmup else None
-        pseudo_model = teacher if teacher is not None else model
+        uda_iter = cycle(uda_loader)
 
         for images, labels in labeled_loader:
             images, labels = images.to(device), labels.to(device)
+            uda_img = next(uda_iter).to(device)
+            # Hard labels from the current network (no EMA); detached inside helper
+            pseudo = generate_pseudo_labels(model, uda_img, threshold, ignore, amp=amp)
+
+            optim.zero_grad(set_to_none=True)
             with amp_autocast(images.device, amp):
                 loss = criterion(model(images), labels)
-                if uda_iter is not None:
-                    uda_img = next(uda_iter).to(device)
-                    pseudo = generate_pseudo_labels(pseudo_model, uda_img, threshold, cfg["ignore_index"], amp=amp)
-                    if (pseudo != cfg["ignore_index"]).sum() >= min_px:
-                        loss = loss + lam * criterion(model(uda_img), pseudo)
-            optim.zero_grad(set_to_none=True)
+                if alpha > 0 and (pseudo != ignore).sum() >= min_px:
+                    loss = loss + alpha * criterion(model(uda_img), pseudo)
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
-            if teacher is not None:
-                update_ema(teacher, model, ema_decay)
 
-        val = evaluate_model(model, val_loader, device, cfg["num_classes"], cfg["ignore_index"], amp=amp)
+        val = evaluate_model(model, val_loader, device, cfg["num_classes"], ignore, amp=amp)
         history["val_miou"].append(val["mIoU"])
-        print("SS-joint epoch", epoch + 1, "lam", round(lam, 2), "thr", round(threshold, 2),
+        print("PL epoch", epoch + 1, "α", round(alpha, 2), "thr", round(threshold, 2),
               "mer_val_mIoU", round(val["mIoU"], 4))
         best = _best_state(model, val["mIoU"], best)
 
@@ -479,26 +404,88 @@ def train_semisup_joint(model, labeled_samples, uda_samples, val_samples, cfg, d
     return model, history
 
 
-def train_combo(model, labeled_samples, uda_samples, val_samples, cfg, device):
-    """Joint semi-supervision plus optional extra pseudo-label polish."""
-    joint_cfg = {**cfg, "ema_decay": cfg.get("ema_decay", 0.99)}
-    model, hist = train_semisup_joint(model, labeled_samples, uda_samples, val_samples, joint_cfg, device)
+def train_mean_teacher(model, labeled_samples, uda_samples, val_samples, cfg, device):
+    """Mean Teacher: CE on labeled MER + λ(t)·MSE(softmax student, softmax EMA teacher)."""
+    if not labeled_samples:
+        raise ValueError("mer_labeled_adapt is empty")
+    if not uda_samples:
+        raise ValueError("mer_uda is empty")
 
-    extra = cfg.get("combo_extra_pseudo_epochs", 0)
-    if extra > 0 and uda_samples:
-        polish_cfg = {
-            **cfg,
-            "epochs_uda": extra,
-            "ema_decay": cfg.get("ema_decay", 0.99),
-            "uda_lr_factor": cfg.get("combo_extra_pseudo_lr_factor", 0.05),
-        }
-        model, hist_polish = train_pseudolabel(model, uda_samples, val_samples, polish_cfg, device, use_ema=True)
-        hist["best_miou"] = max(hist["best_miou"], hist_polish["best_miou"])
-    return model, hist
+    student = model.to(device)
+    teacher = clone_teacher(student).to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=cfg["ignore_index"])
+    optim = torch.optim.AdamW(student.parameters(), lr=_uda_lr(cfg), weight_decay=cfg["weight_decay"])
+    amp = use_amp(cfg)
+    scaler = grad_scaler(amp)
+
+    labeled_loader = _seg_loader(labeled_samples, cfg, shuffle=True)
+    uda_loader = _unlabeled_loader(uda_samples, cfg, shuffle=True)
+    val_loader = _seg_loader(val_samples, cfg, shuffle=False)
+
+    epochs = cfg["epochs_semisup"]
+    decay = cfg.get("mt_ema_decay", 0.99)
+    w_max = cfg.get("mt_consistency_weight", 1.0)
+    ramp = cfg.get("mt_rampup_epochs", 5)
+    noise_std = cfg.get("mt_noise_std", 0.1)
+    ignore = cfg["ignore_index"]
+
+    history = {"val_miou": []}
+    best = (-1.0, None)
+    global_step = 0
+    ramp_steps = max(int(ramp * max(len(labeled_loader), 1)), 1)
+
+    for epoch in range(epochs):
+        student.train()
+        teacher.eval()
+        uda_iter = cycle(uda_loader)
+        cons_sum = 0.0
+        n_steps = 0
+
+        for images, labels in labeled_loader:
+            images, labels = images.to(device), labels.to(device)
+            uda_img = next(uda_iter).to(device)
+            lam = w_max * sigmoid_rampup(global_step, ramp_steps)
+
+            optim.zero_grad(set_to_none=True)
+            with amp_autocast(images.device, amp):
+                loss_sup = criterion(student(images), labels)
+                student_u = student(_input_noise(uda_img, noise_std))
+                with torch.no_grad():
+                    teacher_u = teacher(_input_noise(uda_img, noise_std))
+                loss_cons = consistency_mse(student_u, teacher_u)
+                loss = loss_sup + lam * loss_cons
+
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
+            update_ema(teacher, student, decay)
+
+            cons_sum += float(loss_cons.detach())
+            n_steps += 1
+            global_step += 1
+
+        # Paper: evaluate / keep the EMA teacher
+        val = evaluate_model(teacher, val_loader, device, cfg["num_classes"], ignore, amp=amp)
+        history["val_miou"].append(val["mIoU"])
+        print(
+            "MeanTeacher epoch", epoch + 1,
+            "λ", round(lam, 3),
+            "cons", round(cons_sum / max(n_steps, 1), 4),
+            "mer_val_mIoU", round(val["mIoU"], 4),
+        )
+        if val["mIoU"] > best[0]:
+            best = (val["mIoU"], deepcopy(teacher.state_dict()))
+
+    if best[1] is not None:
+        teacher.load_state_dict(best[1])
+        student.load_state_dict(best[1])
+    history["best_miou"] = best[0]
+    return teacher, history
 
 
 FEATURE_METHODS = ("coral", "mmd", "dann")
-NEEDS_INIT = ("coral", "mmd", "dann", "adda", "pseudolabel", "pseudolabel_ema", "semisup", "semisup_joint", "combo")
+SSL_METHODS = ("finetune", "pseudolabel", "mean_teacher")
+NEEDS_INIT = ("coral", "mmd", "dann", "adda", *SSL_METHODS)
 
 
 def run_method(method, splits, cfg, device, init_ckpt=None):
@@ -511,16 +498,16 @@ def run_method(method, splits, cfg, device, init_ckpt=None):
         return train_feature_uda(model, method, splits["msl_train"], splits["mer_uda"], splits["mer_val"], cfg, device)
     if method == "adda":
         return train_adda(model, splits["msl_train"], splits["mer_uda"], splits["mer_val"], cfg, device)
+    if method == "finetune":
+        return train_finetune(model, splits["mer_labeled_adapt"], splits["mer_val"], cfg, device)
     if method == "pseudolabel":
-        return train_pseudolabel(model, splits["mer_uda"], splits["mer_val"], cfg, device, use_ema=False)
-    if method == "pseudolabel_ema":
-        return train_pseudolabel(model, splits["mer_uda"], splits["mer_val"], cfg, device, use_ema=True)
-    if method == "semisup":
-        return train_semisup(model, splits["mer_labeled_adapt"], splits["mer_uda"], splits["mer_val"], cfg, device)
-    if method == "semisup_joint":
-        return train_semisup_joint(model, splits["mer_labeled_adapt"], splits["mer_uda"], splits["mer_val"], cfg, device)
-    if method == "combo":
-        return train_combo(model, splits["mer_labeled_adapt"], splits["mer_uda"], splits["mer_val"], cfg, device)
+        return train_pseudolabel(
+            model, splits["mer_labeled_adapt"], splits["mer_uda"], splits["mer_val"], cfg, device
+        )
+    if method == "mean_teacher":
+        return train_mean_teacher(
+            model, splits["mer_labeled_adapt"], splits["mer_uda"], splits["mer_val"], cfg, device
+        )
     raise ValueError("unknown method:", method)
 
 
@@ -530,9 +517,11 @@ def main():
     from utils import set_seed, setup_device
 
     p = argparse.ArgumentParser(description="Train a single Mars segmentation method.")
-    p.add_argument("--method", required=True,
-                   choices=["supervised", *FEATURE_METHODS, "adda", "pseudolabel", "pseudolabel_ema",
-                            "semisup", "semisup_joint", "combo"])
+    p.add_argument(
+        "--method",
+        required=True,
+        choices=["supervised", *FEATURE_METHODS, "adda", *SSL_METHODS],
+    )
     p.add_argument("--preset", default="budget", choices=["budget", "followup", "adda"])
     p.add_argument("--data-root", default=None)
     p.add_argument("--output-dir", default="outputs")

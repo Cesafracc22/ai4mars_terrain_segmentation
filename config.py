@@ -47,17 +47,18 @@ DEFAULTS: dict = {
     "epochs_semisup": 10,
     "uda_lr_factor": 0.1,
     "semisup_lr_factor": 0.1,
+
+    # Pseudo-labeling (Lee): CE on labeled MER + α(t)·CE on hard unlabeled masks.
     "semisup_lambda_uda": 1.0,
-    "semisup_lambda_ramp_epochs": 0,
-    "semisup_pseudo_warmup_epochs": 1,
+    "semisup_lambda_ramp_epochs": 4,
     "uda_confidence_threshold": 0.9,
-    "uda_confidence_threshold_end": None,
-    "uda_confidence_ramp_epochs": None,
     "uda_min_pseudo_pixels": 100,
-    "uda_freeze_encoder_epochs": 0,
-    "ema_decay": None,
-    "combo_extra_pseudo_epochs": 0,
-    "combo_extra_pseudo_lr_factor": 0.05,
+
+    # Mean Teacher: CE on labeled MER + λ(t)·MSE(softmax student, softmax teacher).
+    "mt_ema_decay": 0.99,
+    "mt_consistency_weight": 1.0,
+    "mt_rampup_epochs": 5,
+    "mt_noise_std": 0.1,
 
     "adda_epochs_disc": 5,
     "adda_epochs_adapt": 10,
@@ -77,24 +78,19 @@ PRESET_ADDA: dict = {
     "batch_size": 32,
 }
 
+# Slightly longer / lower LR for MER semi-supervised runs.
 PRESET_FOLLOWUP: dict = {
-    "epochs_supervised": 12,
-    "early_stop_patience": 4,
-    "epochs_uda": 12,
     "epochs_semisup": 12,
     "uda_lr_factor": 0.05,
     "semisup_lr_factor": 0.05,
-    "semisup_lambda_uda": 0.5,
+    "semisup_lambda_uda": 1.0,
     "semisup_lambda_ramp_epochs": 4,
-    "semisup_pseudo_warmup_epochs": 2,
-    "uda_confidence_threshold": 0.92,
-    "uda_confidence_threshold_end": 0.97,
-    "uda_confidence_ramp_epochs": 8,
-    "uda_min_pseudo_pixels": 200,
-    "ema_decay": 0.995,
-    "uda_freeze_encoder_epochs": 2,
-    "combo_extra_pseudo_epochs": 4,
-    "combo_extra_pseudo_lr_factor": 0.02,
+    "uda_confidence_threshold": 0.9,
+    "uda_min_pseudo_pixels": 100,
+    "mt_ema_decay": 0.99,
+    "mt_consistency_weight": 1.0,
+    "mt_rampup_epochs": 5,
+    "mt_noise_std": 0.1,
 }
 
 PRESETS = {"budget": PRESET_BUDGET, "followup": PRESET_FOLLOWUP, "adda": PRESET_ADDA}

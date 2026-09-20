@@ -55,7 +55,7 @@ def cmd_e1_search(args):
     out_dir = Path(cfg["output_dir"]) / "e1_search"
 
     wanted = args.candidates or E1_DEFAULT
-    summary = {"candidates": [], "best": None, "zero_shot_mer_test": None}
+    summary = {"candidates": [], "best": None, "baseline_mer_test": None}
     best = (-1.0, "", "")
 
     for cand in [c for c in E1_CANDIDATES if c["name"] in wanted]:
@@ -80,9 +80,9 @@ def cmd_e1_search(args):
     print("\nbest by msl_val:", best[1], round(best[0], 4))
 
     if best[2]:
-        print("zero-shot test of winner:")
+        print("baseline test of winner:")
         m = load_checkpoint(best[2], cfg["num_classes"], device)
-        summary["zero_shot_mer_test"] = _eval(m, splits, ["mer_test"], cfg, device)
+        summary["baseline_mer_test"] = _eval(m, splits, ["mer_test"], cfg, device)
     _save(summary, out_dir / "e1_hparam_summary.json")
     print("winner checkpoint:", best[2])
 
@@ -101,22 +101,34 @@ def cmd_pipeline(args):
     save_checkpoint(model, str(e1_ckpt))
     summary["experiments"]["E1"] = {"best_msl_val_mIoU": hist["best_miou"], "ckpt": str(e1_ckpt)}
 
-    print("\n========== E2: zero-shot (val) ==========")
-    summary["experiments"]["E2_zeroshot_val"] = _eval(model, splits, ["msl_val", "mer_val", "m2020_val"], cfg, device)
+    print("\n========== E2: baseline (val) ==========")
+    summary["experiments"]["E2_baseline_val"] = _eval(model, splits, ["msl_val", "mer_val", "m2020_val"], cfg, device)
 
-    ckpts = {"zeroshot": str(e1_ckpt)}
-    stages = [("coral", "coral"), ("mmd", "mmd"), ("dann", "dann"), ("adda", "adda"),
-              ("pseudolabel", "pseudolabel"), ("semisup", "semisup")]
+    ckpts = {"baseline": str(e1_ckpt)}
+    stages = [
+        ("coral", "coral"),
+        ("mmd", "mmd"),
+        ("dann", "dann"),
+        ("adda", "adda"),
+        ("finetune", "finetune"),
+        ("pseudolabel", "pseudolabel"),
+        ("mean_teacher", "mean_teacher"),
+    ]
     for name, method in stages:
         print("\n==========", method, "(from E1) ==========")
-        cfg_m = get_config("adda", **{k: cfg[k] for k in ("data_root", "output_dir")}) if method == "adda" else cfg
+        if method == "adda":
+            cfg_m = get_config("adda", **{k: cfg[k] for k in ("data_root", "output_dir")})
+        elif method in ("finetune", "pseudolabel", "mean_teacher"):
+            cfg_m = get_config("followup", **{k: cfg[k] for k in ("data_root", "output_dir")})
+        else:
+            cfg_m = cfg
         m, h = run_method(method, splits, cfg_m, device, init_ckpt=str(e1_ckpt))
         ckpt = run / (name + ".pt")
         save_checkpoint(m, str(ckpt))
         ckpts[name] = str(ckpt)
         summary["experiments"][name] = {"best_mer_val_mIoU": h["best_miou"], "ckpt": str(ckpt)}
 
-    print("\n========== E7: FINAL TEST (once) ==========")
+    print("\n========== FINAL TEST (once) ==========")
     for name, ckpt in ckpts.items():
         if not Path(ckpt).exists():
             continue
@@ -128,13 +140,9 @@ def cmd_pipeline(args):
 
 
 FOLLOWUP = [
-    ("F0_pl_baseline", "pseudolabel", {}),
-    ("F1_pl_ema", "pseudolabel_ema", {}),
-    ("F2_pl_ema_strict", "pseudolabel_ema",
-     {"uda_confidence_threshold": 0.95, "uda_confidence_threshold_end": 0.98,
-      "uda_lr_factor": 0.02, "uda_freeze_encoder_epochs": 3}),
-    ("F3_ss_baseline", "semisup", {}),
-    ("F4_ss_joint", "semisup_joint", {"semisup_lambda_uda": 0.5}),
+    ("F0_finetune", "finetune", {}),
+    ("F1_pseudolabel", "pseudolabel", {}),
+    ("F2_mean_teacher", "mean_teacher", {}),
 ]
 
 
